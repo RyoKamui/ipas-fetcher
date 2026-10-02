@@ -1,0 +1,121 @@
+name: IPA intake
+
+# Daily fetcher for a private build pipeline. Checks the tracked apps for
+# updates, requests and waits for decryption, downloads the new builds, and
+# uploads them into the pipeline's intake release — the expensive phases run
+# here on free public minutes, and nothing is published in this repository.
+# When anything landed, it dispatches the pipeline's build workflow so
+# processing starts immediately.
+#
+# The checkout is the pipeline repository itself: the fetch tooling reads the
+# tracked-app list and its settings from that tree, so this repo holds no
+# copies of either. Secrets:
+#
+#   INTAKE_REPO   target repository, OWNER/NAME
+#   INTAKE_TOKEN  fine-grained PAT for that repository, Contents read/write
+#                 and Actions read/write
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # daily; GitHub routinely slips scheduled runs some minutes
+  workflow_dispatch:
+    inputs:
+      region:
+        description: App Store region used for downloads and decryption requests
+        required: true
+        default: us
+        type: string
+      force-dispatch:
+        description: Dispatch the pipeline even when nothing new was staged (verifies the token)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Runs can last for hours while jobs settle; never overlap.
+concurrency:
+  group: ipa-intake
+  cancel-in-progress: false
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # Idle unless a service serves a Cloudflare challenge; the fetch script
+    # only talks to it when it needs a challenge solved.
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:v3.5.0
+        ports:
+          - 8191:8191
+        options: >-
+          --shm-size=1g
+    env:
+      INTAKE_REPO: ${{ secrets.INTAKE_REPO }}
+      INTAKE_TOKEN: ${{ secrets.INTAKE_TOKEN }}
+    steps:
+      - name: Check out the pipeline repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.INTAKE_REPO }}
+          token: ${{ secrets.INTAKE_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install browser-fingerprinted client
+        run: pip install "curl_cffi>=0.7,<1"
+
+      - name: Ensure the intake release exists
+        env: { GH_TOKEN: "${{ secrets.INTAKE_TOKEN }}" }
+        run: |
+          gh release view raw --repo "$INTAKE_REPO" >/dev/null 2>&1 || \
+            gh release create raw --repo "$INTAKE_REPO" \
+              --title raw --notes "Automated storage list"
+
+      - name: Fetch the newest builds into the intake release
+        id: fetch
+        env:
+          FLARESOLVERR_URL: http://localhost:8191
+          GH_TOKEN: "${{ secrets.INTAKE_TOKEN }}"
+        run: >-
+          python tools/fetch_decrypted.py
+          --repository "$INTAKE_REPO"
+          --token "$INTAKE_TOKEN"
+          --region "${{ inputs.region || 'us' }}"
+          --poll-seconds 180
+          --max-concurrent 4
+
+      - name: Check upstream mirrors
+        id: mirrors
+        env: { GH_TOKEN: "${{ secrets.INTAKE_TOKEN }}" }
+        # Exit code 3 means a newer upstream build is waiting for the
+        # pipeline's mirror jobs; the checks upload nothing themselves.
+        run: |
+          ready=false
+          for tool in kumone orionblur apollo; do
+            set +e
+            python "tools/fetch_${tool}.py" --check \
+              --repository "$INTAKE_REPO" --token "$INTAKE_TOKEN"
+            status=$?
+            set -e
+            if [ "$status" -eq 3 ]; then
+              echo "[$tool] newer upstream build waiting"
+              ready=true
+            elif [ "$status" -ne 0 ]; then
+              echo "[$tool] check failed (status $status); continuing" >&2
+            fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch the pipeline
+        if: >-
+          inputs.force-dispatch == true ||
+          steps.fetch.outputs.changed == 'true' ||
+          steps.mirrors.outputs.ready == 'true'
+        env: { GH_TOKEN: "${{ secrets.INTAKE_TOKEN }}" }
+        run: gh workflow run pipeline.yml --repo "$INTAKE_REPO" -f skip-fetch=true
